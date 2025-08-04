@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QPushButton, QTextEdit, QGroupBox, QMessageBox,
                              QProgressBar, QSpinBox, QCheckBox)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QFont, QTextCursor
+from PyQt6.QtGui import QFont, QTextCursor, QPalette
 import ipaddress
 import re
 import subprocess
@@ -75,95 +75,17 @@ COMMON_PORTS = [
 ]
 
 
-class HostnameThread(QThread):
-    """主机名检测线程类"""
-    hostname_updated = pyqtSignal(str, str)  # ip, hostname
-    hostname_finished = pyqtSignal()
-    
-    def __init__(self, ip_list, timeout):
-        super().__init__()
-        self.ip_list = ip_list
-        self.timeout = timeout
-        self.is_running = False
-    
-    def run(self):
-        self.is_running = True
-        try:
-            for ip in self.ip_list:
-                if not self.is_running:
-                    break
-                
-                hostname = self._get_hostname(ip)
-                self.hostname_updated.emit(ip, hostname)
-            
-        except Exception as e:
-            print(f"主机名检测出错: {str(e)}")
-        
-        self.hostname_finished.emit()
-    
-    def stop(self):
-        self.is_running = False
-    
-    def _get_hostname(self, ip):
-        """获取主机名"""
-        try:
-            # 尝试通过反向DNS查询获取主机名
-            hostname = socket.gethostbyaddr(ip)[0]
-            
-            # 如果返回的是IP地址本身，说明没有主机名记录
-            if hostname == ip:
-                # 尝试通过端口检测获取设备类型
-                device_type = self._get_device_type(ip)
-                return device_type
-            
-            return hostname
-        except (socket.herror, socket.gaierror, OSError):
-            # 尝试通过端口检测获取设备类型
-            device_type = self._get_device_type(ip)
-            return device_type
-    
-    def _get_device_type(self, ip):
-        """通过端口检测获取设备类型"""
-        try:
-            # 检测常见端口来判断设备类型
-            common_ports = {
-                137: "Windows-Device",  # NetBIOS
-                445: "Windows-Device",  # SMB
-                22: "Linux-Device",     # SSH
-                23: "Telnet-Device",    # Telnet
-                80: "Web-Device",       # HTTP
-                443: "Web-Device",      # HTTPS
-                3389: "RDP-Device",     # RDP
-                5900: "VNC-Device",     # VNC
-                3306: "MySQL-Device",   # MySQL
-                5432: "PostgreSQL-Device", # PostgreSQL
-            }
-            
-            for port, device_type in common_ports.items():
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(1.0)
-                    result = sock.connect_ex((ip, port))
-                    sock.close()
-                    
-                    if result == 0:
-                        return device_type
-                except:
-                    continue
-            
-            return "Network-Device"  # 默认网络设备
-            
-        except Exception:
-            return "Network-Device"
+
 
 
 class ScannerThread(QThread):
     """扫描线程类"""
     progress_updated = pyqtSignal(int)
     result_updated = pyqtSignal(str)
+    result_with_port = pyqtSignal(str, int)  # 发送结果和端口号
     scan_finished = pyqtSignal()
     
-    def __init__(self, start_ip, end_ip, ports, timeout, max_threads, include_common_ports=False, hostname_dict=None):
+    def __init__(self, start_ip, end_ip, ports, timeout, max_threads, include_common_ports=False):
         super().__init__()
         self.start_ip = start_ip
         self.end_ip = end_ip
@@ -171,7 +93,7 @@ class ScannerThread(QThread):
         self.timeout = timeout
         self.max_threads = max_threads
         self.include_common_ports = include_common_ports
-        self.hostname_dict = hostname_dict or {}  # IP到主机名的映射
+        self.hostname_dict = {}  # IP到主机名的映射
         self.is_running = False
         
     def run(self):
@@ -184,9 +106,18 @@ class ScannerThread(QThread):
             # 解析端口
             port_list = self._parse_ports(self.ports, self.include_common_ports)
             
+            # 开始混合扫描：主机名分析 + 端口扫描
+            self.result_updated.emit("开始扫描：同时进行主机名分析和端口检测...")
+            
             total_ips = end_ip_int - start_ip_int + 1
             total_scans = total_ips * len(port_list)
             current_scan = 0
+            
+            # 显示扫描信息
+            self.result_updated.emit(f"扫描范围：{self.start_ip} - {self.end_ip} ({total_ips} 个IP)")
+            self.result_updated.emit(f"端口数量：{len(port_list)} 个端口")
+            self.result_updated.emit(f"线程数量：{self.max_threads} 个并发线程")
+            self.result_updated.emit("开始端口扫描...")
             
             # 创建线程池
             threads = []
@@ -198,6 +129,11 @@ class ScannerThread(QThread):
                     
                 ip = str(ipaddress.IPv4Address(ip_int))
                 
+                # 先分析主机名
+                hostname = self._get_hostname(ip)
+                self.hostname_dict[ip] = hostname
+                
+                # 然后立即开始端口扫描
                 for port in port_list:
                     if not self.is_running:
                         break
@@ -229,16 +165,11 @@ class ScannerThread(QThread):
                 if self.is_running:
                     thread.join()
             
-            # 输出结果
+            # 检查是否有结果
             if not results:
                 self.result_updated.emit("扫描完成！未发现开放端口。")
             else:
-                # 按IP和端口排序
-                sorted_results = sorted(results, key=lambda x: (x[0], x[1]))
-                for ip, port, service_info in sorted_results:
-                    # 获取主机名
-                    hostname = self._get_hostname(ip)
-                    self.result_updated.emit(f"{ip}:{port} -{hostname}- {service_info}")
+                self.result_updated.emit(f"扫描完成！共发现 {len(results)} 个开放端口。")
                 
         except Exception as e:
             self.result_updated.emit(f"扫描出错: {str(e)}\n")
@@ -247,6 +178,90 @@ class ScannerThread(QThread):
     
     def stop(self):
         self.is_running = False
+    
+
+    
+    def _get_hostname(self, ip):
+        """获取主机名"""
+        try:
+            # 设置DNS查询超时 - 缩短到0.3秒
+            socket.setdefaulttimeout(0.3)
+            
+            # 尝试通过反向DNS查询获取主机名
+            hostname = socket.gethostbyaddr(ip)[0]
+            
+            # 如果返回的是IP地址本身，说明没有主机名记录
+            if hostname == ip:
+                return "Unknown"
+            
+            return hostname
+        except (socket.herror, socket.gaierror, OSError, socket.timeout):
+            return "Unknown"
+        finally:
+            # 恢复默认超时设置
+            socket.setdefaulttimeout(None)
+    
+    def _get_device_type_fast(self, ip):
+        """快速设备类型检测 - 只检测最常用的端口"""
+        try:
+            # 只检测最常用的几个端口，超时时间缩短
+            common_ports = {
+                80: "Web-Device",       # HTTP
+                443: "Web-Device",      # HTTPS
+                22: "Linux-Device",     # SSH
+                3389: "RDP-Device",     # RDP
+            }
+            
+            for port, device_type in common_ports.items():
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.3)  # 缩短到0.3秒超时
+                    result = sock.connect_ex((ip, port))
+                    sock.close()
+                    
+                    if result == 0:
+                        return device_type
+                except:
+                    continue
+            
+            return "Network-Device"  # 默认网络设备
+            
+        except Exception:
+            return "Network-Device"
+    
+    def _get_device_type(self, ip):
+        """通过端口检测获取设备类型"""
+        try:
+            # 检测常见端口来判断设备类型
+            common_ports = {
+                137: "Windows-Device",  # NetBIOS
+                445: "Windows-Device",  # SMB
+                22: "Linux-Device",     # SSH
+                23: "Telnet-Device",    # Telnet
+                80: "Web-Device",       # HTTP
+                443: "Web-Device",      # HTTPS
+                3389: "RDP-Device",     # RDP
+                5900: "VNC-Device",     # VNC
+                3306: "MySQL-Device",   # MySQL
+                5432: "PostgreSQL-Device", # PostgreSQL
+            }
+            
+            for port, device_type in common_ports.items():
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(3.0)  # 设置3秒超时
+                    result = sock.connect_ex((ip, port))
+                    sock.close()
+                    
+                    if result == 0:
+                        return device_type
+                except:
+                    continue
+            
+            return "Network-Device"  # 默认网络设备
+            
+        except Exception:
+            return "Network-Device"
     
     def _parse_ports(self, ports_str, include_common_ports=False):
         """解析端口字符串"""
@@ -289,13 +304,16 @@ class ScannerThread(QThread):
             result = sock.connect_ex((ip, port))
             
             if result == 0:
-                # 获取预检测的主机名
-                hostname = self.hostname_dict.get(ip, "Unknown")
                 # 检测服务类型
                 service_info = self._detect_service(ip, port, sock)
                 results.append((ip, port, service_info))
-                # 实时发送结果
-                result_signal.emit(f"{ip}:{port} -{hostname}- {service_info}")
+                
+                # 实时显示结果
+                hostname = self.hostname_dict.get(ip, "Unknown")
+                result_text = f"{ip}:{port} -{hostname}- {service_info}"
+                result_signal.emit(result_text)
+                # 发送带端口号的结果用于颜色标记
+                self.result_with_port.emit(result_text, port)
             
             sock.close()
                 
@@ -1014,8 +1032,7 @@ class IPScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.scanner_thread = None
-        self.hostname_thread = None
-        self.hostname_dict = {}  # 存储IP到主机名的映射
+        self.result_line_count = 0  # 用于交替背景色
         self.init_ui()
         
         # 设置窗口标题
@@ -1038,6 +1055,9 @@ class IPScannerGUI(QMainWindow):
         
         # 扫描结果区
         self.create_results_group(main_layout)
+        
+        # 颜色图例区
+        self.create_color_legend(main_layout)
         
         # 按钮区
         self.create_buttons(main_layout)
@@ -1165,9 +1185,17 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         # 设置样式表减少行距
         self.results_text.setStyleSheet("""
             QTextEdit {
-                padding: 2px;
+                padding: 4px;
+                border: 1px solid #ccc;
+                border-radius: 4px;
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 10px;
+                line-height: 1.2;
             }
         """)
+        
+        # 启用HTML支持
+        self.results_text.setAcceptRichText(True)
         
         results_layout.addWidget(self.results_text)
         
@@ -1199,6 +1227,69 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         button_layout.addWidget(self.exit_button)
         
         parent_layout.addLayout(button_layout)
+    
+    def create_color_legend(self, parent_layout):
+        """创建颜色图例"""
+        legend_group = QGroupBox("端口类型颜色图例")
+        legend_layout = QHBoxLayout()
+        
+        # 定义图例项
+        legend_items = [
+            ("Web服务", "web"),
+            ("远程访问", "remote"),
+            ("数据库", "database"),
+            ("邮件服务", "mail"),
+            ("文件传输", "file"),
+            ("网络服务", "network"),
+            ("游戏服务", "game"),
+            ("消息队列", "mq"),
+            ("监控服务", "monitor"),
+            ("其他服务", "other")
+        ]
+        
+        for label, category in legend_items:
+            color = self._get_port_color_by_category(category)
+            legend_item = QLabel(f"● {label}")
+            legend_item.setStyleSheet(f"color: {color}; font-weight: bold; margin: 2px;")
+            legend_layout.addWidget(legend_item)
+        
+        legend_layout.addStretch()
+        legend_group.setLayout(legend_layout)
+        parent_layout.addWidget(legend_group)
+    
+    def _get_port_color_by_category(self, category):
+        """根据类别获取端口颜色"""
+        is_dark_theme = self._is_dark_theme()
+        
+        color_schemes = {
+            'light': {
+                'web': '#2E8B57',      # 海绿色
+                'remote': '#8A2BE2',    # 蓝紫色
+                'database': '#DAA520',  # 金麦色
+                'mail': '#DC143C',      # 深红色
+                'file': '#4682B4',      # 钢蓝色
+                'network': '#32CD32',   # 酸橙绿
+                'game': '#FF4500',      # 橙红色
+                'mq': '#9370DB',        # 中等紫色
+                'monitor': '#20B2AA',   # 浅海绿
+                'other': '#696969'      # 暗灰色
+            },
+            'dark': {
+                'web': '#90EE90',       # 浅绿色
+                'remote': '#DDA0DD',    # 浅紫色
+                'database': '#F0E68C',  # 浅黄色
+                'mail': '#FFB6C1',      # 浅粉色
+                'file': '#87CEEB',      # 天蓝色
+                'network': '#98FB98',   # 浅绿色
+                'game': '#FFA07A',      # 浅鲑鱼色
+                'mq': '#E6E6FA',        # 淡紫色
+                'monitor': '#AFEEEE',   # 浅青色
+                'other': '#D3D3D3'      # 浅灰色
+            }
+        }
+        
+        scheme = color_schemes['dark'] if is_dark_theme else color_schemes['light']
+        return scheme.get(category, scheme['other'])
         
     def validate_inputs(self):
         """验证输入数据"""
@@ -1283,6 +1374,7 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         
         # 清空结果
         self.results_text.clear()
+        self.result_line_count = 0  # 重置行计数
         
         # 创建扫描线程
         self.scanner_thread = ScannerThread(
@@ -1297,6 +1389,7 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         # 连接信号
         self.scanner_thread.progress_updated.connect(self.update_progress)
         self.scanner_thread.result_updated.connect(self.update_results)
+        self.scanner_thread.result_with_port.connect(self.update_results_with_color)
         self.scanner_thread.scan_finished.connect(self.scan_finished)
         
         # 更新UI状态
@@ -1327,6 +1420,136 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         cursor = self.results_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.results_text.setTextCursor(cursor)
+    
+    def update_results_with_color(self, text, port):
+        """更新带颜色标记的扫描结果"""
+        # 确定端口类型和颜色
+        port_color = self._get_port_color(port)
+        
+        # 获取系统主题适配的背景色
+        bg_colors = self._get_background_colors()
+        bg_color = bg_colors[0] if self.result_line_count % 2 == 0 else bg_colors[1]
+        
+        # 创建带颜色的HTML文本
+        html_text = f'<div style="background-color: {bg_color}; padding: 2px; margin: 1px 0; border-radius: 2px;">'
+        html_text += f'<span style="color: {port_color}; font-weight: 500;">{text}</span></div>'
+        
+        # 添加到结果文本
+        self.results_text.append(html_text)
+        
+        # 滚动到底部
+        cursor = self.results_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.results_text.setTextCursor(cursor)
+        
+        # 增加行计数
+        self.result_line_count += 1
+    
+    def _get_background_colors(self):
+        """获取适配系统主题的背景色"""
+        is_dark_theme = self._is_dark_theme()
+        
+        if is_dark_theme:
+            # 暗色主题背景色
+            return ["#2d2d2d", "#3a3a3a"]  # 深灰交替
+        else:
+            # 明色主题背景色
+            return ["#f8f9fa", "#ffffff"]   # 浅灰交替
+    
+    def _get_port_color(self, port):
+        """根据端口号确定颜色"""
+        # 获取系统主题
+        is_dark_theme = self._is_dark_theme()
+        
+        # 端口分类定义
+        port_categories = {
+            # Web服务端口
+            'web': [80, 443, 8080, 8443, 8000, 8001, 8002, 8003, 8004, 8005, 
+                   8006, 8007, 8008, 8009, 8010, 8081, 8082, 8083, 8084, 8085,
+                   8086, 8087, 8088, 8089, 8090, 9000, 9001, 9002, 9003, 9004,
+                   9005, 9006, 9007, 9008, 9009, 9010, 8444, 8445, 8446, 8447,
+                   8448, 8449, 8450, 7443, 8161],
+            
+            # 远程访问端口
+            'remote': [22, 23, 3389, 5900, 5901, 5902, 5903, 5904, 5905, 5906,
+                      5907, 5908, 5909, 5910, 6000, 6001, 6002, 6003, 6004, 6005,
+                      6006, 6007, 6008, 6009, 6010, 54321, 60000],
+            
+            # 数据库端口
+            'database': [3306, 5432, 1433, 1434, 1521, 27017, 27018, 27019, 28017,
+                        6379, 11211, 5984, 50000, 50070, 50075, 50090],
+            
+            # 邮件服务端口
+            'mail': [25, 110, 143, 465, 587, 993, 995],
+            
+            # 文件传输端口
+            'file': [20, 21, 69, 445, 548, 2049],
+            
+            # 网络服务端口
+            'network': [53, 67, 68, 123, 135, 137, 138, 139, 161, 162, 389, 636, 514, 515, 520],
+            
+            # 游戏服务端口
+            'game': [7777],
+            
+            # 消息队列端口
+            'mq': [5671, 5672],
+            
+            # 监控端口
+            'monitor': [2181, 7077, 9200, 9300],
+            
+            # 其他服务端口
+            'other': [1080, 1433, 1521, 1723, 2181, 3306, 3389, 5432, 5900, 6379, 8080, 8443, 9000, 9200, 11211, 27017]
+        }
+        
+        # 颜色方案（支持明暗主题）
+        color_schemes = {
+            'light': {
+                'web': '#2E8B57',      # 海绿色
+                'remote': '#8A2BE2',    # 蓝紫色
+                'database': '#DAA520',  # 金麦色
+                'mail': '#DC143C',      # 深红色
+                'file': '#4682B4',      # 钢蓝色
+                'network': '#32CD32',   # 酸橙绿
+                'game': '#FF4500',      # 橙红色
+                'mq': '#9370DB',        # 中等紫色
+                'monitor': '#20B2AA',   # 浅海绿
+                'other': '#696969'      # 暗灰色
+            },
+            'dark': {
+                'web': '#90EE90',       # 浅绿色
+                'remote': '#DDA0DD',    # 浅紫色
+                'database': '#F0E68C',  # 浅黄色
+                'mail': '#FFB6C1',      # 浅粉色
+                'file': '#87CEEB',      # 天蓝色
+                'network': '#98FB98',   # 浅绿色
+                'game': '#FFA07A',      # 浅鲑鱼色
+                'mq': '#E6E6FA',        # 淡紫色
+                'monitor': '#AFEEEE',   # 浅青色
+                'other': '#D3D3D3'      # 浅灰色
+            }
+        }
+        
+        # 选择颜色方案
+        scheme = color_schemes['dark'] if is_dark_theme else color_schemes['light']
+        
+        # 确定端口类别
+        for category, ports in port_categories.items():
+            if port in ports:
+                return scheme[category]
+        
+        # 默认颜色
+        return scheme['other']
+    
+    def _is_dark_theme(self):
+        """检测系统是否为暗色主题"""
+        try:
+            palette = self.palette()
+            background_color = palette.color(QPalette.ColorRole.Window)
+            # 计算背景色的亮度
+            brightness = (background_color.red() * 299 + background_color.green() * 587 + background_color.blue() * 114) / 1000
+            return brightness < 128
+        except:
+            return False
     
     def scan_finished(self):
         """扫描完成"""
