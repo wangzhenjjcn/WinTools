@@ -10,6 +10,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QTextCursor
 import ipaddress
 import re
+import subprocess
 
 """
 IP端口扫描器
@@ -17,6 +18,42 @@ Copyright (c) 2024 wangzhenjjcn@gmail.com
 Author: wangzhenjjcn
 GitHub: https://github.com/wangzhenjjcn/WinTools
 """
+
+def get_local_ip_and_subnet():
+    """获取本地IP地址和子网信息"""
+    try:
+        # 获取本地主机名
+        hostname = socket.gethostname()
+        # 获取本地IP地址
+        local_ip = socket.gethostbyname(hostname)
+        
+        # 解析IP地址
+        ip_obj = ipaddress.IPv4Address(local_ip)
+        
+        # 获取子网信息
+        # 常见的子网掩码
+        common_masks = [24, 16, 8]  # /24, /16, /8
+        
+        for mask in common_masks:
+            try:
+                network = ipaddress.IPv4Network(f"{local_ip}/{mask}", strict=False)
+                if ip_obj in network:
+                    # 计算起始和结束IP
+                    start_ip = str(network.network_address + 1)  # 排除网络地址
+                    end_ip = str(network.broadcast_address - 1)   # 排除广播地址
+                    return local_ip, start_ip, end_ip, mask
+            except ValueError:
+                continue
+        
+        # 如果无法确定子网，使用默认的/24子网
+        network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+        start_ip = str(network.network_address + 1)
+        end_ip = str(network.broadcast_address - 1)
+        return local_ip, start_ip, end_ip, 24
+        
+    except Exception as e:
+        # 如果获取失败，返回默认值
+        return "192.168.1.1", "192.168.0.1", "192.168.1.255", 24
 
 # 常见端口列表
 COMMON_PORTS = [
@@ -38,13 +75,95 @@ COMMON_PORTS = [
 ]
 
 
+class HostnameThread(QThread):
+    """主机名检测线程类"""
+    hostname_updated = pyqtSignal(str, str)  # ip, hostname
+    hostname_finished = pyqtSignal()
+    
+    def __init__(self, ip_list, timeout):
+        super().__init__()
+        self.ip_list = ip_list
+        self.timeout = timeout
+        self.is_running = False
+    
+    def run(self):
+        self.is_running = True
+        try:
+            for ip in self.ip_list:
+                if not self.is_running:
+                    break
+                
+                hostname = self._get_hostname(ip)
+                self.hostname_updated.emit(ip, hostname)
+            
+        except Exception as e:
+            print(f"主机名检测出错: {str(e)}")
+        
+        self.hostname_finished.emit()
+    
+    def stop(self):
+        self.is_running = False
+    
+    def _get_hostname(self, ip):
+        """获取主机名"""
+        try:
+            # 尝试通过反向DNS查询获取主机名
+            hostname = socket.gethostbyaddr(ip)[0]
+            
+            # 如果返回的是IP地址本身，说明没有主机名记录
+            if hostname == ip:
+                # 尝试通过端口检测获取设备类型
+                device_type = self._get_device_type(ip)
+                return device_type
+            
+            return hostname
+        except (socket.herror, socket.gaierror, OSError):
+            # 尝试通过端口检测获取设备类型
+            device_type = self._get_device_type(ip)
+            return device_type
+    
+    def _get_device_type(self, ip):
+        """通过端口检测获取设备类型"""
+        try:
+            # 检测常见端口来判断设备类型
+            common_ports = {
+                137: "Windows-Device",  # NetBIOS
+                445: "Windows-Device",  # SMB
+                22: "Linux-Device",     # SSH
+                23: "Telnet-Device",    # Telnet
+                80: "Web-Device",       # HTTP
+                443: "Web-Device",      # HTTPS
+                3389: "RDP-Device",     # RDP
+                5900: "VNC-Device",     # VNC
+                3306: "MySQL-Device",   # MySQL
+                5432: "PostgreSQL-Device", # PostgreSQL
+            }
+            
+            for port, device_type in common_ports.items():
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(1.0)
+                    result = sock.connect_ex((ip, port))
+                    sock.close()
+                    
+                    if result == 0:
+                        return device_type
+                except:
+                    continue
+            
+            return "Network-Device"  # 默认网络设备
+            
+        except Exception:
+            return "Network-Device"
+
+
 class ScannerThread(QThread):
     """扫描线程类"""
     progress_updated = pyqtSignal(int)
     result_updated = pyqtSignal(str)
     scan_finished = pyqtSignal()
     
-    def __init__(self, start_ip, end_ip, ports, timeout, max_threads, include_common_ports=False):
+    def __init__(self, start_ip, end_ip, ports, timeout, max_threads, include_common_ports=False, hostname_dict=None):
         super().__init__()
         self.start_ip = start_ip
         self.end_ip = end_ip
@@ -52,6 +171,7 @@ class ScannerThread(QThread):
         self.timeout = timeout
         self.max_threads = max_threads
         self.include_common_ports = include_common_ports
+        self.hostname_dict = hostname_dict or {}  # IP到主机名的映射
         self.is_running = False
         
     def run(self):
@@ -169,8 +289,8 @@ class ScannerThread(QThread):
             result = sock.connect_ex((ip, port))
             
             if result == 0:
-                # 检测主机名
-                hostname = self._get_hostname(ip)
+                # 获取预检测的主机名
+                hostname = self.hostname_dict.get(ip, "Unknown")
                 # 检测服务类型
                 service_info = self._detect_service(ip, port, sock)
                 results.append((ip, port, service_info))
@@ -181,21 +301,6 @@ class ScannerThread(QThread):
                 
         except Exception:
             pass
-    
-    def _get_hostname(self, ip):
-        """获取主机名"""
-        try:
-            # 尝试通过反向DNS查询获取主机名
-            hostname = socket.gethostbyaddr(ip)[0]
-            
-            # 如果返回的是IP地址本身，说明没有主机名记录
-            if hostname == ip:
-                return "Unknown"
-            
-            return hostname
-        except (socket.herror, socket.gaierror, OSError):
-            # 如果无法获取主机名，返回Unknown
-            return "Unknown"
     
     def _detect_service(self, ip, port, sock):
         """检测服务类型"""
@@ -909,6 +1014,8 @@ class IPScannerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.scanner_thread = None
+        self.hostname_thread = None
+        self.hostname_dict = {}  # 存储IP到主机名的映射
         self.init_ui()
         
         # 设置窗口标题
@@ -945,43 +1052,51 @@ class IPScannerGUI(QMainWindow):
         settings_group = QGroupBox("信息设置")
         settings_layout = QGridLayout()
         
+        # 获取本地IP和子网信息
+        local_ip, start_ip, end_ip, subnet_mask = get_local_ip_and_subnet()
+        
+        # 显示本地IP信息
+        local_ip_label = QLabel(f"本地IP: {local_ip} (子网: /{subnet_mask})")
+        local_ip_label.setStyleSheet("color: #666; font-size: 9px;")
+        settings_layout.addWidget(local_ip_label, 0, 0, 1, 4)
+        
         # 起始IP
-        settings_layout.addWidget(QLabel("起始IP:"), 0, 0)
-        self.start_ip_edit = QLineEdit("192.168.0.1")
+        settings_layout.addWidget(QLabel("起始IP:"), 1, 0)
+        self.start_ip_edit = QLineEdit(start_ip)
         self.start_ip_edit.setPlaceholderText("例如: 192.168.0.1")
-        settings_layout.addWidget(self.start_ip_edit, 0, 1)
+        settings_layout.addWidget(self.start_ip_edit, 1, 1)
         
         # 结束IP
-        settings_layout.addWidget(QLabel("结束IP:"), 0, 2)
-        self.end_ip_edit = QLineEdit("192.168.1.255")
+        settings_layout.addWidget(QLabel("结束IP:"), 1, 2)
+        self.end_ip_edit = QLineEdit(end_ip)
         self.end_ip_edit.setPlaceholderText("例如: 192.168.1.255")
-        settings_layout.addWidget(self.end_ip_edit, 0, 3)
+        settings_layout.addWidget(self.end_ip_edit, 1, 3)
         
         # 端口号
-        settings_layout.addWidget(QLabel("端口号:"), 1, 0)
+        settings_layout.addWidget(QLabel("端口号:"), 2, 0)
         self.ports_edit = QLineEdit("80,443,3389,138-139,3306,22,21,23,25,53,110,143,445,993,995,1433,1521,5432,5900,6379,8080,8443,9000,9200,11211,27017,5000-5010,5900-5910,6000-6010,8000-8010,8080-8090,8443-8450,9000-9010")
         self.ports_edit.setPlaceholderText("例如: 80,443,3389,138-139,3306,22,21,23,25,53,110,143,445,993,995,1433,1521,5432,5900,6379,8080,8443,9000,9200,11211,27017,5000-5010,5900-5910,6000-6010,8000-8010,8080-8090,8443-8450,9000-9010")
-        settings_layout.addWidget(self.ports_edit, 1, 1, 1, 2)
+        settings_layout.addWidget(self.ports_edit, 2, 1, 1, 2)
         
         # 常见端口检测选项
         self.common_ports_checkbox = QCheckBox("检测常见端口")
         self.common_ports_checkbox.setToolTip("勾选后将自动检测所有常见端口，同时保留手动输入的端口")
-        settings_layout.addWidget(self.common_ports_checkbox, 1, 3)
+        settings_layout.addWidget(self.common_ports_checkbox, 2, 3)
         
         # 超时
-        settings_layout.addWidget(QLabel("超时(毫秒):"), 2, 0)
+        settings_layout.addWidget(QLabel("超时(毫秒):"), 3, 0)
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(100, 9999)
         self.timeout_spin.setValue(1000)
         self.timeout_spin.setSuffix(" ms")
-        settings_layout.addWidget(self.timeout_spin, 2, 1)
+        settings_layout.addWidget(self.timeout_spin, 3, 1)
         
         # 线程数
-        settings_layout.addWidget(QLabel("线程数:"), 2, 2)
+        settings_layout.addWidget(QLabel("线程数:"), 3, 2)
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 9999)
         self.threads_spin.setValue(500)
-        settings_layout.addWidget(self.threads_spin, 2, 3)
+        settings_layout.addWidget(self.threads_spin, 3, 3)
         
         settings_group.setLayout(settings_layout)
         parent_layout.addWidget(settings_group)
