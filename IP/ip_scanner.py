@@ -181,8 +181,8 @@ class IPScannerGUI(QMainWindow):
         
         # 起始IP
         settings_layout.addWidget(QLabel("起始IP:"), 0, 0)
-        self.start_ip_edit = QLineEdit("192.168.1.1")
-        self.start_ip_edit.setPlaceholderText("例如: 192.168.1.1")
+        self.start_ip_edit = QLineEdit("192.168.0.1")
+        self.start_ip_edit.setPlaceholderText("例如: 192.168.0.1")
         settings_layout.addWidget(self.start_ip_edit, 0, 1)
         
         # 结束IP
@@ -193,8 +193,8 @@ class IPScannerGUI(QMainWindow):
         
         # 端口号
         settings_layout.addWidget(QLabel("端口号:"), 1, 0)
-        self.ports_edit = QLineEdit("80,139,440-445")
-        self.ports_edit.setPlaceholderText("例如: 80,139,440-445")
+        self.ports_edit = QLineEdit("80,443,3389,138-139,3306,12345,5000-5001,21-23,445")
+        self.ports_edit.setPlaceholderText("例如: 80,443,3389,138-139,3306,12345,5000-5001,21-23,445")
         settings_layout.addWidget(self.ports_edit, 1, 1, 1, 3)
         
         # 超时
@@ -209,7 +209,7 @@ class IPScannerGUI(QMainWindow):
         settings_layout.addWidget(QLabel("线程数:"), 2, 2)
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 9999)
-        self.threads_spin.setValue(10)
+        self.threads_spin.setValue(500)
         settings_layout.addWidget(self.threads_spin, 2, 3)
         
         settings_group.setLayout(settings_layout)
