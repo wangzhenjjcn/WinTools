@@ -1,0 +1,27 @@
+# 文件搜索工具 - Everything (增强版) 依赖包
+
+# 标准库依赖（已包含在Python中）
+# tkinter - GUI框架
+# os - 操作系统接口
+# threading - 多线程支持
+# datetime - 日期时间处理
+# json - JSON数据处理
+# pathlib - 路径处理
+# sqlite3 - 轻量级数据库
+# hashlib - 哈希计算
+# pickle - 数据序列化
+# shutil - 文件操作工具
+
+# 可选依赖（用于增强功能）
+# pywin32 - Windows API支持（用于文件属性）
+# pillow - 图片处理（用于图片属性）
+# mutagen - 音频文件属性
+# opencv-python - 视频文件属性
+
+# 安装命令：
+# pip install pywin32 pillow mutagen opencv-python
+
+# 注意：
+# 1. 主要功能使用标准库，无需额外安装
+# 2. 可选依赖用于获取更详细的文件属性
+# 3. 如果缺少可选依赖，程序仍可正常运行，但某些属性功能可能受限 
