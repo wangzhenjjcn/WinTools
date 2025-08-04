@@ -2,6 +2,10 @@
 
 Windows工具集合
 
+Copyright (c) 2024 wangzhenjjcn@gmail.com  
+Author: wangzhenjjcn  
+GitHub: https://github.com/wangzhenjjcn/WinTools
+
 ## 工具列表
 
 ### IP端口扫描器
