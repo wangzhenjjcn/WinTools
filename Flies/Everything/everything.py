@@ -209,6 +209,61 @@ class FileProperties:
             pass
         return properties
 
+class PropertySorter:
+    """属性排序管理器"""
+    
+    def __init__(self):
+        self.sortable_properties = {
+            'name': '文件名',
+            'path': '路径',
+            'size': '大小',
+            'type': '类型',
+            'modified': '修改时间',
+            'created': '创建时间',
+            'length': '文件名长度',
+            'attributes': '文件属性',
+            'hash': '哈希值',
+            'extension': '扩展名',
+            'size_on_disk': '磁盘大小',
+            'accessed': '访问时间',
+            'is_hidden': '是否隐藏',
+            'is_readonly': '是否只读',
+            'is_system': '是否系统文件'
+        }
+    
+    def get_sort_key(self, file_info, property_name):
+        """获取排序键值"""
+        if property_name == 'size':
+            return file_info.get('size', 0)
+        elif property_name == 'modified':
+            return file_info.get('modified', datetime.min)
+        elif property_name == 'created':
+            return file_info.get('created', datetime.min)
+        elif property_name == 'accessed':
+            return file_info.get('accessed', datetime.min)
+        elif property_name == 'length':
+            return len(file_info.get('name', ''))
+        elif property_name == 'attributes':
+            return file_info.get('attributes', '')
+        elif property_name == 'hash':
+            return file_info.get('hash', '')
+        elif property_name == 'extension':
+            return os.path.splitext(file_info.get('name', ''))[1].lower()
+        elif property_name == 'size_on_disk':
+            return file_info.get('size_on_disk', 0)
+        elif property_name == 'is_hidden':
+            return file_info.get('is_hidden', False)
+        elif property_name == 'is_readonly':
+            return file_info.get('is_readonly', False)
+        elif property_name == 'is_system':
+            return file_info.get('is_system', False)
+        else:
+            return file_info.get(property_name, '')
+    
+    def sort_files(self, files, property_name, reverse=False):
+        """排序文件列表"""
+        return sorted(files, key=lambda x: self.get_sort_key(x, property_name), reverse=reverse)
+
 class LightweightDatabase:
     """轻量级数据库管理器"""
     
@@ -394,6 +449,7 @@ class FileSearchApp:
         # 初始化组件
         self.properties_manager = FileProperties()
         self.database = LightweightDatabase(self.data_dir)
+        self.property_sorter = PropertySorter()
         
         # 文件索引数据
         self.files_data = []
@@ -461,6 +517,7 @@ class FileSearchApp:
         # 工具菜单
         tools_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="工具", menu=tools_menu)
+        tools_menu.add_command(label="高级排序", command=self.show_advanced_sort)
         tools_menu.add_command(label="数据库管理", command=self.show_database_manager)
         tools_menu.add_command(label="属性查看器", command=self.show_properties_viewer)
         tools_menu.add_separator()
@@ -528,17 +585,20 @@ class FileSearchApp:
         list_frame = ttk.Frame(parent)
         list_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # 创建Treeview
-        columns = ('name', 'path', 'size', 'type', 'modified', 'created')
+        # 创建Treeview - 添加更多属性列
+        columns = ('name', 'path', 'size', 'type', 'modified', 'created', 'length', 'attributes', 'hash')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='headings', height=20)
         
-        # 定义列标题
+        # 定义列标题 - 支持属性排序
         self.tree.heading('name', text='文件名', command=lambda: self.sort_treeview('name'))
         self.tree.heading('path', text='路径', command=lambda: self.sort_treeview('path'))
         self.tree.heading('size', text='大小', command=lambda: self.sort_treeview('size'))
         self.tree.heading('type', text='类型', command=lambda: self.sort_treeview('type'))
         self.tree.heading('modified', text='修改时间', command=lambda: self.sort_treeview('modified'))
         self.tree.heading('created', text='创建时间', command=lambda: self.sort_treeview('created'))
+        self.tree.heading('length', text='文件名长度', command=lambda: self.sort_treeview('length'))
+        self.tree.heading('attributes', text='属性', command=lambda: self.sort_treeview('attributes'))
+        self.tree.heading('hash', text='哈希值', command=lambda: self.sort_treeview('hash'))
         
         # 设置列宽
         self.tree.column('name', width=200)
@@ -547,6 +607,9 @@ class FileSearchApp:
         self.tree.column('type', width=100)
         self.tree.column('modified', width=150)
         self.tree.column('created', width=150)
+        self.tree.column('length', width=100)
+        self.tree.column('attributes', width=80)
+        self.tree.column('hash', width=120)
         
         # 添加滚动条
         scrollbar_y = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -708,13 +771,26 @@ class FileSearchApp:
             modified_str = file_info['modified'].strftime('%Y-%m-%d %H:%M')
             created_str = file_info['created'].strftime('%Y-%m-%d %H:%M')
             
+            # 获取文件名长度
+            filename_length = len(file_info['name'])
+            
+            # 获取属性字符串
+            attributes = file_info.get('attributes', '')
+            
+            # 获取哈希值（显示前8位）
+            hash_value = file_info.get('hash', '')
+            hash_display = hash_value[:8] if hash_value else ''
+            
             self.tree.insert('', 'end', values=(
                 file_info['name'],
                 file_info['path'],
                 size_str,
                 file_info['type'],
                 modified_str,
-                created_str
+                created_str,
+                filename_length,
+                attributes,
+                hash_display
             ), tags=(file_info['id'],))
             
     def format_size(self, size_bytes):
@@ -738,17 +814,30 @@ class FileSearchApp:
         current_sort[column] = not reverse
         self.current_sort = current_sort
         
-        # 排序数据
-        if column == 'size':
-            self.filtered_data.sort(key=lambda x: x['size'], reverse=reverse)
-        elif column == 'modified':
-            self.filtered_data.sort(key=lambda x: x['modified'], reverse=reverse)
-        elif column == 'created':
-            self.filtered_data.sort(key=lambda x: x['created'], reverse=reverse)
-        else:
-            self.filtered_data.sort(key=lambda x: x[column], reverse=reverse)
+        # 使用属性排序管理器进行排序
+        self.filtered_data = self.property_sorter.sort_files(self.filtered_data, column, reverse)
             
         self.update_file_list()
+        
+        # 显示排序方向指示器
+        self.update_sort_indicators(column, reverse)
+        
+    def update_sort_indicators(self, current_column, reverse):
+        """更新排序方向指示器"""
+        # 清除所有列的排序指示器
+        for col in ['name', 'path', 'size', 'type', 'modified', 'created', 'length', 'attributes', 'hash']:
+            current_text = self.tree.heading(col)['text']
+            # 移除现有的排序指示器
+            if current_text.endswith(' ↑') or current_text.endswith(' ↓'):
+                base_text = current_text[:-2]
+            else:
+                base_text = current_text
+            self.tree.heading(col, text=base_text)
+        
+        # 为当前排序列添加指示器
+        current_text = self.tree.heading(current_column)['text']
+        indicator = ' ↓' if reverse else ' ↑'
+        self.tree.heading(current_column, text=current_text + indicator)
         
     def on_file_double_click(self, event):
         """双击文件打开"""
@@ -901,6 +990,89 @@ class FileSearchApp:
         """从管理器重新索引"""
         window.destroy()
         self.reindex_files()
+        
+    def show_advanced_sort(self):
+        """显示高级排序对话框"""
+        sort_window = tk.Toplevel(self.root)
+        sort_window.title("高级排序")
+        sort_window.geometry("500x400")
+        sort_window.transient(self.root)
+        sort_window.grab_set()
+        
+        # 主框架
+        main_frame = ttk.Frame(sort_window)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # 排序属性选择
+        ttk.Label(main_frame, text="选择排序属性:").pack(anchor=tk.W, pady=(0, 5))
+        
+        # 属性选择框架
+        props_frame = ttk.Frame(main_frame)
+        props_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 创建属性列表
+        columns = ('property', 'description')
+        self.sort_tree = ttk.Treeview(props_frame, columns=columns, show='headings', height=15)
+        
+        self.sort_tree.heading('property', text='属性名')
+        self.sort_tree.heading('description', text='描述')
+        
+        self.sort_tree.column('property', width=150)
+        self.sort_tree.column('description', width=300)
+        
+        # 添加可排序属性
+        for prop_key, prop_desc in self.property_sorter.sortable_properties.items():
+            self.sort_tree.insert('', 'end', values=(prop_key, prop_desc))
+        
+        self.sort_tree.pack(fill=tk.BOTH, expand=True)
+        
+        # 排序方向选择
+        direction_frame = ttk.Frame(main_frame)
+        direction_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Label(direction_frame, text="排序方向:").pack(side=tk.LEFT)
+        
+        self.sort_direction = tk.StringVar(value="ascending")
+        ttk.Radiobutton(direction_frame, text="升序", variable=self.sort_direction, 
+                       value="ascending").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Radiobutton(direction_frame, text="降序", variable=self.sort_direction, 
+                       value="descending").pack(side=tk.LEFT, padx=(10, 0))
+        
+        # 按钮框架
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        ttk.Button(btn_frame, text="应用排序", 
+                  command=lambda: self.apply_advanced_sort(sort_window)).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(btn_frame, text="取消", 
+                  command=sort_window.destroy).pack(side=tk.LEFT)
+        
+        # 绑定双击事件
+        self.sort_tree.bind('<Double-1>', lambda e: self.apply_advanced_sort(sort_window))
+        
+    def apply_advanced_sort(self, window):
+        """应用高级排序"""
+        selection = self.sort_tree.selection()
+        if not selection:
+            messagebox.showwarning("警告", "请选择一个排序属性")
+            return
+        
+        item = self.sort_tree.item(selection[0])
+        property_name = item['values'][0]
+        reverse = self.sort_direction.get() == "descending"
+        
+        # 应用排序
+        self.filtered_data = self.property_sorter.sort_files(self.filtered_data, property_name, reverse)
+        self.update_file_list()
+        
+        # 更新排序指示器
+        self.update_sort_indicators(property_name, reverse)
+        
+        # 显示排序信息
+        direction_text = "降序" if reverse else "升序"
+        messagebox.showinfo("排序完成", f"已按 {item['values'][1]} {direction_text} 排序")
+        
+        window.destroy()
         
     def show_properties_viewer(self):
         """显示属性查看器"""
