@@ -3,25 +3,51 @@ import os
 import shutil
 import winreg
 import subprocess
+import ctypes
+import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, 
                              QProgressBar, QMenu, QMessageBox, QWidget, QSplitter,
-                             QLineEdit, QComboBox)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+                             QLineEdit, QComboBox, QCheckBox)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QMutex, QWaitCondition
 from PyQt6.QtGui import QIcon, QFont, QColor, QAction
+
+def is_admin():
+    """检测是否具有管理员权限"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def run_as_admin():
+    """以管理员权限重新运行程序"""
+    try:
+        if not is_admin():
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+            sys.exit()
+    except:
+        pass
 
 class FileScanner(QThread):
     """文件扫描线程"""
     progress_updated = pyqtSignal(int)
     file_found = pyqtSignal(dict)
     scan_finished = pyqtSignal()
+    error_occurred = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
         self.running = False
         self.startup_files = self._get_startup_files()
+        self.scan_threads = []
+        self.thread_count = 4  # 默认4个线程
+        self.mutex = QMutex()
+        self.wait_condition = QWaitCondition()
+        self.scanned_files = 0
+        self.total_files = 0
         
     def _get_startup_files(self) -> set:
         """获取开机启动文件列表"""
@@ -135,72 +161,109 @@ class FileScanner(QThread):
     def run(self):
         """开始扫描"""
         self.running = True
-        total_files = 0
-        scanned_files = 0
+        self.scanned_files = 0
         
-        # 计算总文件数
-        for drive in self._get_drives():
-            if os.path.exists(drive):
-                for root, dirs, files in os.walk(drive):
-                    total_files += len(files) + len(dirs)
+        # 获取所有需要扫描的路径
+        all_paths = self._get_all_scan_paths()
+        self.total_files = len(all_paths)
         
-        # 扫描文件
+        if self.total_files == 0:
+            self.scan_finished.emit()
+            return
+        
+        # 使用单线程扫描，但分批处理以提高响应性
+        batch_size = max(100, self.total_files // 100)  # 每批处理100个文件或总文件的1%
+        
+        for i in range(0, len(all_paths), batch_size):
+            if not self.running:
+                break
+                
+            batch = all_paths[i:i + batch_size]
+            self._process_batch(batch)
+            
+            # 更新进度
+            self.scanned_files += len(batch)
+            progress = int(self.scanned_files * 100 / self.total_files) if self.total_files > 0 else 0
+            self.progress_updated.emit(progress)
+        
+        self.scan_finished.emit()
+    
+    def _process_batch(self, batch):
+        """处理一批文件"""
+        for file_path, file_name, is_dir in batch:
+            if not self.running:
+                break
+                
+            try:
+                if is_dir:
+                    file_info = {
+                        'path': file_path,
+                        'name': file_name,
+                        'type': '文件夹',
+                        'size': 0,
+                        'is_system': self._is_system_file(file_path),
+                        'is_program': self._is_program_file(file_path),
+                        'is_startup': False
+                    }
+                else:
+                    file_size = os.path.getsize(file_path)
+                    file_type = self._get_file_type(file_path)
+                    is_startup = file_path.lower() in self.startup_files
+                    
+                    file_info = {
+                        'path': file_path,
+                        'name': file_name,
+                        'type': file_type,
+                        'size': file_size,
+                        'is_system': self._is_system_file(file_path),
+                        'is_program': self._is_program_file(file_path),
+                        'is_startup': is_startup
+                    }
+                
+                self.file_found.emit(file_info)
+                
+            except Exception as e:
+                self.error_occurred.emit(f"处理文件 {file_path} 时出错: {str(e)}")
+    
+    def _get_all_scan_paths(self) -> List[Tuple[str, str, bool]]:
+        """获取所有需要扫描的路径"""
+        paths = []
+        
         for drive in self._get_drives():
             if not self.running:
                 break
                 
             if os.path.exists(drive):
-                for root, dirs, files in os.walk(drive):
-                    if not self.running:
-                        break
-                    
-                    # 处理文件夹
-                    for dir_name in sorted(dirs):
+                try:
+                    for root, dirs, files in os.walk(drive):
                         if not self.running:
                             break
-                        dir_path = os.path.join(root, dir_name)
-                        try:
-                            file_info = {
-                                'path': dir_path,
-                                'name': dir_name,
-                                'type': '文件夹',
-                                'size': 0,
-                                'is_system': self._is_system_file(dir_path),
-                                'is_program': self._is_program_file(dir_path),
-                                'is_startup': False
-                            }
-                            self.file_found.emit(file_info)
-                        except:
-                            pass
-                        scanned_files += 1
-                        self.progress_updated.emit(int(scanned_files * 100 / total_files))
-                    
-                    # 处理文件
-                    for file_name in sorted(files):
-                        if not self.running:
-                            break
-                        file_path = os.path.join(root, file_name)
-                        try:
-                            file_size = os.path.getsize(file_path)
-                            file_type = self._get_file_type(file_path)
-                            is_startup = file_path.lower() in self.startup_files
-                            
-                            file_info = {
-                                'path': file_path,
-                                'name': file_name,
-                                'type': file_type,
-                                'size': file_size,
-                                'is_system': self._is_system_file(file_path),
-                                'is_program': self._is_program_file(file_path),
-                                'is_startup': is_startup
-                            }
-                            self.file_found.emit(file_info)
-                        except:
-                            pass
-                        scanned_files += 1
-                        self.progress_updated.emit(int(scanned_files * 100 / total_files))
+                        
+                        # 添加文件夹
+                        for dir_name in sorted(dirs):
+                            if not self.running:
+                                break
+                            dir_path = os.path.join(root, dir_name)
+                            paths.append((dir_path, dir_name, True))  # True表示是文件夹
+                        
+                        # 添加文件
+                        for file_name in sorted(files):
+                            if not self.running:
+                                break
+                            file_path = os.path.join(root, file_name)
+                            paths.append((file_path, file_name, False))  # False表示是文件
+                except Exception as e:
+                    self.error_occurred.emit(f"扫描路径 {drive} 时出错: {str(e)}")
         
-        self.scan_finished.emit()
+        return paths
+    
+    def _update_progress(self):
+        """更新进度"""
+        self.mutex.lock()
+        self.scanned_files += 1
+        progress = int(self.scanned_files * 100 / self.total_files) if self.total_files > 0 else 0
+        self.mutex.unlock()
+        self.progress_updated.emit(progress)
     
     def _get_drives(self) -> List[str]:
         """获取所有系统盘"""
@@ -220,9 +283,31 @@ class FileCleaner(QMainWindow):
     
     def __init__(self):
         super().__init__()
+        
+        # 检查管理员权限
+        self.check_admin_permission()
+        
         self.scanner = FileScanner()
         self.init_ui()
         self.connect_signals()
+    
+    def check_admin_permission(self):
+        """检查管理员权限"""
+        if not is_admin():
+            reply = QMessageBox.question(
+                self, 
+                "权限提示", 
+                "检测到程序未以管理员权限运行，某些系统文件可能无法访问。\n是否以管理员权限重新启动？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                run_as_admin()
+            else:
+                QMessageBox.information(
+                    self,
+                    "权限说明",
+                    "程序将以普通权限运行，某些系统文件可能无法扫描。"
+                )
         
     def init_ui(self):
         """初始化界面"""
@@ -401,6 +486,7 @@ class FileCleaner(QMainWindow):
         self.scanner.progress_updated.connect(self.update_progress)
         self.scanner.file_found.connect(self.add_file_item)
         self.scanner.scan_finished.connect(self.scan_finished)
+        self.scanner.error_occurred.connect(self.handle_error)
         
     def setup_context_menu(self):
         """设置右键菜单"""
@@ -469,6 +555,10 @@ class FileCleaner(QMainWindow):
         
         # 开始扫描
         self.scanner.start()
+    
+    def handle_error(self, error_msg):
+        """处理错误"""
+        QMessageBox.warning(self, "扫描错误", error_msg)
         
     def stop_scan(self):
         """停止扫描"""
@@ -519,6 +609,9 @@ class FileCleaner(QMainWindow):
         
         # 更新统计信息
         self.update_stats()
+        
+        # 实时更新界面
+        QApplication.processEvents()
     
     def update_stats(self):
         """更新统计信息"""
@@ -710,6 +803,10 @@ class FileCleaner(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')  # 使用Fusion样式
+    
+    # 检查管理员权限
+    if not is_admin():
+        print("警告: 程序未以管理员权限运行，某些系统文件可能无法访问")
     
     window = FileCleaner()
     window.show()
