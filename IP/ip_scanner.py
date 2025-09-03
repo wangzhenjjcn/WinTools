@@ -5,12 +5,14 @@ import time
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QGridLayout, QLabel, QLineEdit, 
                              QPushButton, QTextEdit, QGroupBox, QMessageBox,
-                             QProgressBar, QSpinBox, QCheckBox)
+                             QProgressBar, QSpinBox, QCheckBox, QFileDialog)
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QTextCursor, QPalette
 import ipaddress
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 """
 IP端口扫描器
@@ -22,16 +24,21 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
 def get_local_ip_and_subnet():
     """获取本地IP地址和子网信息"""
     try:
-        # 获取本地主机名
-        hostname = socket.gethostname()
-        # 获取本地IP地址
-        local_ip = socket.gethostbyname(hostname)
+        # 优先通过UDP方式获取本地出站网卡IP，失败则回退主机名解析
+        try:
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.connect(("8.8.8.8", 80))
+            local_ip = udp_sock.getsockname()[0]
+            udp_sock.close()
+        except Exception:
+            # 获取本地主机名与IP
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
         
         # 解析IP地址
         ip_obj = ipaddress.IPv4Address(local_ip)
         
-        # 获取子网信息
-        # 常见的子网掩码
+        # 获取子网信息（常见掩码）
         common_masks = [24, 16, 8]  # /24, /16, /8
         
         for mask in common_masks:
@@ -95,7 +102,8 @@ class ScannerThread(QThread):
         self.include_common_ports = include_common_ports
         self.hostname_dict = {}  # IP到主机名的映射
         self.is_running = False
-        
+        self._executor = None
+    
     def run(self):
         self.is_running = True
         try:
@@ -111,7 +119,7 @@ class ScannerThread(QThread):
             
             total_ips = end_ip_int - start_ip_int + 1
             total_scans = total_ips * len(port_list)
-            current_scan = 0
+            current_completed = 0
             
             # 显示扫描信息
             self.result_updated.emit(f"扫描范围：{self.start_ip} - {self.end_ip} ({total_ips} 个IP)")
@@ -119,51 +127,65 @@ class ScannerThread(QThread):
             self.result_updated.emit(f"线程数量：{self.max_threads} 个并发线程")
             self.result_updated.emit("开始端口扫描...")
             
-            # 创建线程池
-            threads = []
             results = []
             
-            for ip_int in range(start_ip_int, end_ip_int + 1):
-                if not self.is_running:
-                    break
-                    
-                ip = str(ipaddress.IPv4Address(ip_int))
+            # 使用线程池控制并发，避免创建海量线程
+            with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+                pending_futures = []
+                chunk_limit = max(1, self.max_threads * 4)
                 
-                # 先分析主机名
-                hostname = self._get_hostname(ip)
-                self.hostname_dict[ip] = hostname
-                
-                # 然后立即开始端口扫描
-                for port in port_list:
+                for ip_int in range(start_ip_int, end_ip_int + 1):
                     if not self.is_running:
                         break
-                        
-                    # 限制并发线程数
-                    while len([t for t in threads if t.is_alive()]) >= self.max_threads:
-                        time.sleep(0.01)
+                    
+                    ip = str(ipaddress.IPv4Address(ip_int))
+                    
+                    # 先分析主机名（轻量操作）
+                    hostname = self._get_hostname(ip)
+                    self.hostname_dict[ip] = hostname
+                    
+                    # 提交扫描任务（分块提交以控制内存）
+                    for port in port_list:
                         if not self.is_running:
                             break
+                        pending_futures.append(executor.submit(self._scan_port_task, ip, port))
+                        
+                        if len(pending_futures) >= chunk_limit:
+                            for future in as_completed(pending_futures):
+                                if not self.is_running:
+                                    break
+                                try:
+                                    res = future.result()
+                                except Exception:
+                                    res = None
+                                finally:
+                                    current_completed += 1
+                                    progress = int((current_completed / total_scans) * 100)
+                                    self.progress_updated.emit(progress)
+                                if res:
+                                    rip, rport, service_info = res
+                                    results.append(res)
+                                    hostname = self.hostname_dict.get(rip, "Unknown")
+                                    result_text = f"{rip}:{rport} -{hostname}- {service_info}"
+                                    self.result_with_port.emit(result_text, rport)
+                            pending_futures.clear()
                     
-                    if not self.is_running:
-                        break
-                    
-                    # 创建扫描线程
-                    scan_thread = threading.Thread(
-                        target=self._scan_port,
-                        args=(ip, port, results, self.result_updated)
-                    )
-                    scan_thread.daemon = True
-                    scan_thread.start()
-                    threads.append(scan_thread)
-                    
-                    current_scan += 1
-                    progress = int((current_scan / total_scans) * 100)
-                    self.progress_updated.emit(progress)
-            
-            # 等待所有线程完成
-            for thread in threads:
-                if self.is_running:
-                    thread.join()
+                # 清空剩余任务
+                for future in as_completed(pending_futures):
+                    try:
+                        res = future.result()
+                    except Exception:
+                        res = None
+                    finally:
+                        current_completed += 1
+                        progress = int((current_completed / total_scans) * 100)
+                        self.progress_updated.emit(progress)
+                    if res:
+                        rip, rport, service_info = res
+                        results.append(res)
+                        hostname = self.hostname_dict.get(rip, "Unknown")
+                        result_text = f"{rip}:{rport} -{hostname}- {service_info}"
+                        self.result_with_port.emit(result_text, rport)
             
             # 检查是否有结果
             if not results:
@@ -180,7 +202,6 @@ class ScannerThread(QThread):
         self.is_running = False
     
 
-    
     def _get_hostname(self, ip):
         """获取主机名"""
         try:
@@ -296,6 +317,24 @@ class ScannerThread(QThread):
         
         return list(set(port_list))  # 去重
     
+    def _scan_port_task(self, ip, port):
+        """线程池任务：扫描单个端口，返回 (ip, port, service_info) 或 None"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout / 1000.0)
+            result = sock.connect_ex((ip, port))
+            if result == 0:
+                service_info = self._detect_service(ip, port, sock)
+                return (ip, port, service_info)
+        except Exception:
+            return None
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        return None
+    
     def _scan_port(self, ip, port, results, result_signal):
         """扫描单个端口"""
         try:
@@ -308,11 +347,9 @@ class ScannerThread(QThread):
                 service_info = self._detect_service(ip, port, sock)
                 results.append((ip, port, service_info))
                 
-                # 实时显示结果
+                # 实时显示结果（仅彩色行，避免重复输出）
                 hostname = self.hostname_dict.get(ip, "Unknown")
                 result_text = f"{ip}:{port} -{hostname}- {service_info}"
-                result_signal.emit(result_text)
-                # 发送带端口号的结果用于颜色标记
                 self.result_with_port.emit(result_text, port)
             
             sock.close()
@@ -1215,6 +1252,15 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         self.stop_button.setEnabled(False)
         button_layout.addWidget(self.stop_button)
         
+        # 新增：清空与导出
+        self.clear_button = QPushButton("清空结果")
+        self.clear_button.clicked.connect(self.clear_results)
+        button_layout.addWidget(self.clear_button)
+        
+        self.export_button = QPushButton("导出结果")
+        self.export_button.clicked.connect(self.export_results)
+        button_layout.addWidget(self.export_button)
+        
         button_layout.addStretch()
         
         # 版权信息按钮
@@ -1362,7 +1408,7 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         if include_common_ports:
             port_list.extend(COMMON_PORTS)
         
-        return list(set(port_list))
+        return list(set(port_list))  # 去重
     
     def start_scan(self):
         """开始扫描"""
@@ -1557,6 +1603,25 @@ GitHub: https://github.com/wangzhenjjcn/WinTools
         self.stop_button.setEnabled(False)
         self.progress_bar.setVisible(False)
         # 扫描完成，不添加额外提示
+
+    def clear_results(self):
+        """清空结果"""
+        self.results_text.clear()
+        self.result_line_count = 0
+
+    def export_results(self):
+        """导出结果到文本文件（使用纯文本，便于分享和检索）"""
+        default_name = f"扫描结果_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存结果", default_name, "文本文件 (*.txt)")
+        if not file_path:
+            return
+        try:
+            # 导出采用纯文本，自动去除颜色HTML
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(self.results_text.toPlainText())
+            QMessageBox.information(self, "导出成功", f"结果已保存到:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"保存文件时出错:\n{str(e)}")
 
 
 def main():
